@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+
+# written by video_blur_mask_gui.py when it is run from inside the repo
+*.mask.png
+*.mask.*.png
+*_blur.*
