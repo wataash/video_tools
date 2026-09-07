@@ -5,3 +5,9 @@ __pycache__/
 *.mask.png
 *.mask.*.png
 *_blur.*
+
+# generated text-editor settings, exports and local planning previews
+*.text.json
+*_text.mp4
+.video-text-*/
+work/

@@ -6,6 +6,7 @@ Personal tools for working with video. Each tool is a standalone Python script, 
 | Tool | What it does |
 | --- | --- |
 | [video_blur_mask_gui](video_blur_mask_gui.md) | Paint a blur mask while the video plays, then burn it in with ffmpeg |
+| [video_text_gui](video_text_gui.md) | Place and style timed text with audio playback, then export an MP4 |
 
 ## Requirements
 

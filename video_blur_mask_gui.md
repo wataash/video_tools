@@ -29,7 +29,8 @@ the area the subjects move through; strokes accumulate into one mask that covers
   erases.
 - Wheel: pen size. Shift+wheel: edge hardness. `[` and `]` also change the pen size.
 - Space: play/pause. Left/Right: one frame, Shift+Left/Right: ten frames, Home/End: first/last frame.
-  Click the timeline to seek. Playback speed is 0.25x / 0.5x / 1x.
+  Click the timeline to seek. Playback speed is 0.25x / 0.5x / 1x (default: 1x).
+  Audio plays at the selected speed, synchronized with the video. "Mute" toggles sound.
 - `v`: cycle the view (composite -> mask tinted red -> original). The red view is the easiest way to
   spot places you missed.
 - `s`: save the mask (plus a timestamped backup). Ctrl+Z / Ctrl+Y: undo / redo. `q`: quit.
@@ -50,8 +51,11 @@ the area the subjects move through; strokes accumulate into one mask that covers
   `alphamerge` to put the mask in the alpha channel -> `overlay`.
   A single still image is enough for the mask input: framesync's `repeatlast` reuses it for every
   frame and the output frame count matches the input, so `-loop` is not needed.
-- The preview decimates frames with `cap.grab()` down to `RENDER_FPS` (25), which is enough for a
-  60fps source at 0.25x-1x playback.
+- `QMediaPlayer` decodes video and audio on its playback clock. `QVideoSink` retains only the latest
+  frame; a timer composites previews at up to `RENDER_FPS` (25). Expensive previews skip stale frames
+  instead of slowing playback. OpenCV is used for exact frame stepping and paused seeks.
+- Frames are reduced to display resolution before conversion to numpy. Mask coverage is cached
+  until the mask changes, avoiding a full-resolution scan on every playback frame.
 - The frame is composited at device resolution (never upscaled beyond the video's own size) and Qt
   stretches it to the widget, so the preview stays sharp on a HiDPI screen.
 - Blurring is applied only inside the mask's bounding box (widened by 3 sigma), and a large sigma is

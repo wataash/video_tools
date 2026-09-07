@@ -28,6 +28,7 @@ import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoFrame, QVideoSink
 
 
 try:
@@ -635,9 +636,10 @@ class PaintWindow(QtWidgets.QMainWindow):
         self.loaded_existing = self.painter.load()
 
         self.current_frame_index = 0
+        self.current_seconds = 0.0
         self.current_bgr: np.ndarray | None = None
         self.view_mode = "composite"
-        self.speed = 0.5
+        self.speed = 1.0
         self.painting = False
         self.erasing = False
         self.last_point: tuple[int, int] | None = None
@@ -646,6 +648,17 @@ class PaintWindow(QtWidgets.QMainWindow):
         self._mask_cache: tuple[int, int, int] | None = None
         self._mask3: np.ndarray | None = None
         self._mask_bbox: tuple[int, int, int, int] | None = None
+        self._coverage_cache = (-1, 0.0)
+        self._latest_frame = None
+
+        self.player = QMediaPlayer(self)
+        self.audio = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio)
+        self.video_sink = QVideoSink(self)
+        self.player.setVideoSink(self.video_sink)
+        self.video_sink.videoFrameChanged.connect(self.on_video_frame)
+        self.player.playbackStateChanged.connect(self.on_playback_state_changed)
+        self.player.errorOccurred.connect(lambda error, message: self.set_status(f"playback error: {message}"))
 
         self.setWindowTitle(f"video-blur-mask-gui: {video_path.name}")
         self.resize(1280, 900)
@@ -655,6 +668,7 @@ class PaintWindow(QtWidgets.QMainWindow):
         self.playback_timer = QtCore.QTimer(self)
         self.playback_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self.playback_timer.timeout.connect(self.play_next_frame)
+        self.player.setSource(QtCore.QUrl.fromLocalFile(str(video_path.resolve())))
         self.autosave_timer = QtCore.QTimer(self)
         self.autosave_timer.timeout.connect(self.autosave)
         self.autosave_timer.start(AUTOSAVE_INTERVAL_MS)
@@ -692,8 +706,10 @@ class PaintWindow(QtWidgets.QMainWindow):
         self.speed_box = QtWidgets.QComboBox()
         for label, value in (("0.25x", 0.25), ("0.5x", 0.5), ("1x", 1.0)):
             self.speed_box.addItem(label, value)
-        self.speed_box.setCurrentIndex(1)
+        self.speed_box.setCurrentIndex(2)
         self.speed_box.currentIndexChanged.connect(self.on_speed_changed)
+        self.mute_box = QtWidgets.QCheckBox("Mute")
+        self.mute_box.toggled.connect(self.audio.setMuted)
 
         self.view_button = QtWidgets.QPushButton("Composite (v)")
         self.view_button.clicked.connect(self.cycle_view)
@@ -730,7 +746,7 @@ class PaintWindow(QtWidgets.QMainWindow):
 
         row1 = self._make_row(
             self.play_button, prev_button, next_button, None,
-            QtWidgets.QLabel("Speed"), self.speed_box, None,
+            QtWidgets.QLabel("Speed"), self.speed_box, self.mute_box, None,
             QtWidgets.QLabel("View"), self.view_button,
         )
         row1.addStretch(1)
@@ -811,23 +827,13 @@ class PaintWindow(QtWidgets.QMainWindow):
             self.set_status(f"failed to read frame {frame_index}")
             return
         self.current_frame_index = frame_index
+        timestamp = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
+        self.current_seconds = timestamp if timestamp > 0 else frame_index / self.fps
+        self._latest_frame = None
+        self.player.setPosition(round(self.current_seconds * 1000))
         self.current_bgr = frame
         self.render_frame()
         self.sync_timeline()
-
-    def advance_frames(self, step: int) -> bool:
-        """For playback: skip with grab() instead of seeking, which is faster than rewinding."""
-        for _ in range(step - 1):
-            if not self.cap.grab():
-                return False
-        ok, frame = self.cap.read()
-        if not ok:
-            return False
-        self.current_frame_index += step
-        self.current_bgr = frame
-        self.render_frame()
-        self.sync_timeline()
-        return True
 
     def sync_timeline(self) -> None:
         self.timeline.blockSignals(True)
@@ -841,34 +847,52 @@ class PaintWindow(QtWidgets.QMainWindow):
 
     # -- playback --------------------------------------------------------
 
-    def playback_step(self) -> int:
-        return max(1, int(round(self.fps * self.speed / RENDER_FPS)))
-
-    def playback_interval_ms(self) -> int:
-        return max(1, int(round(1000.0 * self.playback_step() / max(1e-6, self.fps * self.speed))))
-
     def stop_playback(self) -> None:
-        self.playback_timer.stop()
-        self.play_button.setText("Play (Space)")
+        self.player.pause()  # on_playback_state_changed stops the preview timer
 
     def toggle_playback(self) -> None:
-        if self.playback_timer.isActive():
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.stop_playback()
             return
-        if self.frame_count and self.current_frame_index >= self.frame_count - 1:
+        if self.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia or (self.frame_count and self.current_frame_index >= self.frame_count - 1):
             self.goto_frame(0)
-        self.play_button.setText("Pause (Space)")
-        self.playback_timer.start(self.playback_interval_ms())
+        self.player.play()
 
     def on_speed_changed(self) -> None:
         self.speed = float(self.speed_box.currentData())
-        if self.playback_timer.isActive():
-            self.playback_timer.start(self.playback_interval_ms())
+        self.player.setPlaybackRate(self.speed)
+
+    def on_playback_state_changed(self, state) -> None:
+        if state == QMediaPlayer.PlaybackState.PlayingState:
+            self.playback_timer.start(round(1000 / RENDER_FPS))
+            self.play_button.setText("Pause (Space)")
+        else:
+            self.playback_timer.stop()
+            self.play_next_frame()
+            self.play_button.setText("Play (Space)")
+
+    def on_video_frame(self, frame) -> None:
+        if frame.isValid() and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            # Decode/audio keep their own clock. Never queue expensive previews.
+            self._latest_frame = QVideoFrame(frame)
 
     def play_next_frame(self) -> None:
-        if not self.advance_frames(self.playback_step()):
-            self.stop_playback()
-            self.set_status("reached the end")
+        frame = self._latest_frame
+        if frame is None:
+            return
+        self._latest_frame = None
+        image = frame.toImage()  # Qt applies the video's display rotation.
+        if image.isNull():
+            return
+        image = image.scaled(*self.display_size(), Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        image = image.convertToFormat(QtGui.QImage.Format.Format_RGB888)
+        data = np.frombuffer(image.constBits(), np.uint8).reshape(image.height(), image.bytesPerLine())
+        rgb = data[:, :image.width() * 3].reshape(image.height(), image.width(), 3)
+        self.current_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        self.current_seconds = max(0.0, frame.startTime() / 1_000_000)
+        self.current_frame_index = min(max(0, self.frame_count - 1), round(self.current_seconds * self.fps))
+        self.render_frame()
+        self.sync_timeline()
 
     def on_timeline_changed(self, value: int) -> None:
         self.stop_playback()
@@ -888,13 +912,16 @@ class PaintWindow(QtWidgets.QMainWindow):
             self._mask_cache = key
         return self._mask3, self._mask_bbox
 
+    def display_size(self) -> tuple[int, int]:
+        """Device resolution, never upscaled; Qt stretches the result if the widget is larger."""
+        scale = min(1.0, self.canvas.fit_scale())
+        return max(1, round(self.video_w * scale)), max(1, round(self.video_h * scale))
+
     def render_frame(self) -> None:
         if self.current_bgr is None:
             return
-        # Render at device resolution but never upscale; Qt stretches the result if the widget is larger.
-        scale = min(1.0, self.canvas.fit_scale())
-        width = max(1, int(round(self.video_w * scale)))
-        height = max(1, int(round(self.video_h * scale)))
+        width, height = self.display_size()
+        scale = width / self.video_w
         interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
         shown = cv2.resize(self.current_bgr, (width, height), interpolation=interpolation)
 
@@ -926,10 +953,12 @@ class PaintWindow(QtWidgets.QMainWindow):
         self.canvas.set_image(image)
 
     def update_labels(self) -> None:
-        seconds = self.current_frame_index / self.fps if self.fps else 0.0
+        seconds = self.current_seconds
+        if self._coverage_cache[0] != self.painter.version:
+            self._coverage_cache = (self.painter.version, self.painter.coverage())
         self.position_label.setText(
             f"{seconds:7.2f}s / {self.duration:.2f}s  frame {self.current_frame_index}/{max(0, self.frame_count - 1)}"
-            f"   pen r={self.pen_slider.value()}  mask {self.painter.coverage() * 100:4.1f}%"
+            f"   pen r={self.pen_slider.value()}  mask {self._coverage_cache[1] * 100:4.1f}%"
             f"{'  *unsaved' if self.painter.unsaved else ''}"
         )
 
@@ -1098,6 +1127,7 @@ class PaintWindow(QtWidgets.QMainWindow):
             except OSError as exc:
                 logger.error("failed to save mask: %s", exc)
         self.stop_playback()
+        self.player.stop()
         self.cap.release()
         event.accept()
 
