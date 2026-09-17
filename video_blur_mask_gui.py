@@ -13,13 +13,16 @@ pytest -v --doctest-modules video_blur_mask_gui.py
 """[1:]
 
 import argparse
+import dataclasses
 import datetime
 import fractions
+import json
 import logging
 import math
 import os
 import pathlib
 import shlex
+import string
 import subprocess
 import sys
 import typing as t
@@ -149,6 +152,8 @@ AUTOSAVE_INTERVAL_MS = 3000
 RENDER_FPS = 25.0  # decimate playback to this fps; the source can be 60fps
 APPROX_BLUR_SIGMA = 6.0  # sigma actually given to GaussianBlur in the approximate preview blur
 VIEW_MODES = ("composite", "overlay", "original")
+KEY_COLUMNS = ("Frame", "Time (s)", "Shape", "X", "Y", "Scale", "")  # keyframe table
+KEY_COLUMN_FRAME, KEY_COLUMN_TIME, KEY_COLUMN_SHAPE, KEY_COLUMN_X, KEY_COLUMN_Y, KEY_COLUMN_SCALE, KEY_COLUMN_DELETE = range(7)
 
 
 # -----------------------------------------------------------------------------
@@ -205,25 +210,333 @@ def mask_bounding_box(mask: np.ndarray, threshold: int = 2) -> tuple[int, int, i
     return x0, y0, x1, y1
 
 
-def build_filter_complex(sigma: float, pixelize: int) -> str:
+@dataclasses.dataclass
+class MaskKeyframe:
+    """One mask placement, expressed in source-video pixels."""
+
+    frame: int
+    center_x: float
+    center_y: float
+    scale: float = 1.0
+    shape_id: str = "A"
+
+
+@dataclasses.dataclass
+class MaskShape:
+    """A separately paintable source shape used by one or more keyframes."""
+
+    shape_id: str
+    filename: str  # "" for A, whose PNG is the mask path itself
+    anchor_x: float
+    anchor_y: float
+
+    @property
+    def anchor(self) -> tuple[float, float]:
+        return self.anchor_x, self.anchor_y
+
+
+@dataclasses.dataclass
+class MaskMotion:
+    """Placements of separately painted masks.
+
+    Before the first keyframe the painted A mask is used.  Between adjacent
+    keyframes of the same shape centre coordinates and scale are linearly
+    interpolated; after the last keyframe its placement is retained.  A pair
+    of equal adjacent keys therefore forms a hold interval.  At a keyframe
+    whose shape differs from the preceding one, the source shape switches at
+    that frame; no misleading pseudo-morph or fade is applied.
     """
-    >>> build_filter_complex(26, 0)
-    '[0:v]split[base][pre];[pre]gblur=sigma=26:steps=3,format=yuva420p[blurred];[1:v]format=gray[mask];[blurred][mask]alphamerge[blurred_a];[base][blurred_a]overlay=0:0[out]'
+
+    width: int
+    height: int
+    fps: float
+    keyframes: list[MaskKeyframe] = dataclasses.field(default_factory=list)
+    shapes: dict[str, MaskShape] = dataclasses.field(default_factory=dict)  # "A" first, always present
+
+    def __post_init__(self) -> None:
+        if "A" not in self.shapes:
+            self.set_shape("A", "", self.width / 2, self.height / 2)
+
+    def set_shape(self, shape_id: str, filename: str, anchor_x: float, anchor_y: float) -> None:
+        self.shapes[shape_id] = MaskShape(shape_id, filename, anchor_x, anchor_y)
+        if shape_id == "A":
+            self.shapes = {"A": self.shapes["A"], **self.shapes}
+
+    def shape_ids(self) -> list[str]:
+        return list(self.shapes)
+
+    def anchor(self, shape_id: str) -> tuple[float, float]:
+        return self.shapes[shape_id].anchor
+
+    def shape_at_frame(self, frame: int) -> str:
+        """Return the source shape shown at ``frame`` (the change is instant)."""
+        previous = next((key for key in reversed(self.keyframes) if key.frame <= frame), None)
+        return "A" if previous is None else previous.shape_id
+
+    @property
+    def uses_transform(self) -> bool:
+        """Whether ffmpeg/the preview need a transformed-mask graph."""
+        return len(self.shapes) > 1 or any(
+            (key.center_x, key.center_y) != self.anchor(key.shape_id) or key.scale != 1.0
+            for key in self.keyframes
+        )
+
+    def sort_keyframes(self) -> None:
+        self.keyframes.sort(key=lambda key: key.frame)
+
+    def keyframe_at(self, frame: int) -> MaskKeyframe | None:
+        return next((key for key in self.keyframes if key.frame == frame), None)
+
+    def transform_at_frame(self, frame: int) -> tuple[float, float, float]:
+        """Return the placement at ``frame``, holding the values at both ends."""
+        shape_id = self.shape_at_frame(frame)
+        x0, y0 = self.anchor(shape_id)
+        if not self.keyframes or frame < self.keyframes[0].frame:
+            return x0, y0, 1.0
+        previous = self.keyframes[0]
+        if frame == previous.frame:
+            return previous.center_x, previous.center_y, previous.scale
+        for following in self.keyframes[1:]:
+            if frame <= following.frame:
+                if frame == following.frame:
+                    return following.center_x, following.center_y, following.scale
+                if previous.shape_id != following.shape_id:
+                    return previous.center_x, previous.center_y, previous.scale
+                amount = (frame - previous.frame) / (following.frame - previous.frame)
+                return (
+                    previous.center_x + (following.center_x - previous.center_x) * amount,
+                    previous.center_y + (following.center_y - previous.center_y) * amount,
+                    previous.scale + (following.scale - previous.scale) * amount,
+                )
+            previous = following
+        return previous.center_x, previous.center_y, previous.scale
+
+    def to_dict(self) -> dict[str, t.Any]:
+        return {
+            "version": 3,
+            "video_size": [self.width, self.height],
+            "fps": self.fps,
+            "anchor": list(self.anchor("A")),
+            "shapes": [
+                {"id": shape.shape_id, "file": shape.filename, "anchor": [shape.anchor_x, shape.anchor_y]}
+                for shape in self.shapes.values() if shape.shape_id != "A"
+            ],
+            "keyframes": [
+                {"frame": key.frame, "center": [key.center_x, key.center_y], "scale": key.scale, "shape": key.shape_id}
+                for key in self.keyframes
+            ],
+        }
+
+    def save(self, path: pathlib.Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(self.to_dict(), indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+
+    @classmethod
+    def load(cls, path: pathlib.Path, width: int, height: int, fps: float) -> "MaskMotion":
+        motion = cls(width, height, fps)
+        if not path.exists():
+            return motion
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            version = data.get("version")
+            source_w, source_h = map(int, data["video_size"])
+            if source_w <= 0 or source_h <= 0:
+                raise ValueError("video_size must be positive")
+            anchor_x, anchor_y = data.get("anchor", [source_w / 2, source_h / 2])
+            motion.set_shape("A", "", float(anchor_x) * width / source_w, float(anchor_y) * height / source_h)
+            if version == 1:
+                # Version 1 had one A -> B movement.  Two keys preserve it exactly.
+                start_frame, end_frame = data["start_frame"], data["end_frame"]
+                end_x, end_y = data["end_center"]
+                end_scale = float(data["end_scale"])
+                if start_frame is not None and end_frame is not None and int(end_frame) > int(start_frame):
+                    if int(start_frame) < 0 or end_scale <= 0 or not math.isfinite(end_scale):
+                        raise ValueError("version-1 motion requires non-negative frames and a positive scale")
+                    base_x, base_y = motion.anchor("A")
+                    motion.keyframes = [
+                        MaskKeyframe(int(start_frame), base_x, base_y),
+                        MaskKeyframe(
+                            int(end_frame), float(end_x) * width / source_w,
+                            float(end_y) * height / source_h, end_scale,
+                        ),
+                    ]
+            elif version in (2, 3):
+                if version == 3:
+                    for raw_shape in data.get("shapes", []):
+                        shape_id = str(raw_shape["id"])
+                        filename = str(raw_shape["file"])
+                        anchor_x, anchor_y = raw_shape["anchor"]
+                        if not shape_id or shape_id == "A" or pathlib.Path(filename).name != filename:
+                            raise ValueError("invalid additional shape")
+                        motion.set_shape(
+                            shape_id, filename, float(anchor_x) * width / source_w, float(anchor_y) * height / source_h,
+                        )
+                for raw_key in data["keyframes"]:
+                    frame = int(raw_key["frame"])
+                    center_x, center_y = raw_key["center"]
+                    scale = float(raw_key["scale"])
+                    if frame < 0 or scale <= 0 or not math.isfinite(scale):
+                        raise ValueError("keyframes require non-negative frames and positive scales")
+                    shape_id = str(raw_key.get("shape", "A"))
+                    if shape_id not in motion.shapes:
+                        raise ValueError("keyframe refers to an unknown shape")
+                    motion.keyframes.append(MaskKeyframe(
+                        frame, float(center_x) * width / source_w, float(center_y) * height / source_h, scale, shape_id,
+                    ))
+                motion.sort_keyframes()
+                if any(a.frame == b.frame for a, b in zip(motion.keyframes, motion.keyframes[1:])):
+                    raise ValueError("duplicate keyframe frames")
+            else:
+                raise ValueError(f"unsupported version {version!r}")
+        except (KeyError, TypeError, ValueError, ZeroDivisionError, json.JSONDecodeError) as exc:
+            logger.warning("failed to read motion settings %s: %s", path, exc)
+            return cls(width, height, fps)
+        return motion
+
+
+def default_motion_path(mask_path: pathlib.Path) -> pathlib.Path:
+    """Store the keyframes next to their PNG without changing the PNG format."""
+    return mask_path.with_suffix(".motion.json")
+
+
+def default_shape_path(mask_path: pathlib.Path, shape_id: str) -> pathlib.Path:
+    """Return a sibling PNG path for an additional painted shape."""
+    safe_id = "".join(char for char in shape_id if char.isalnum() or char in "-_")
+    if not safe_id or safe_id == "A":
+        raise ValueError("additional shape needs a non-A identifier")
+    return mask_path.with_name(f"{mask_path.stem}.shape-{safe_id}.png")
+
+
+def motion_shape_paths(motion: MaskMotion, mask_path: pathlib.Path) -> dict[str, pathlib.Path]:
+    """Resolve v3 relative shape file names next to the primary A PNG."""
+    return {
+        shape_id: mask_path if shape_id == "A" else mask_path.parent / shape.filename
+        for shape_id, shape in motion.shapes.items()
+    }
+
+
+def transform_mask(
+    mask: np.ndarray, anchor_x: float, anchor_y: float, center_x: float, center_y: float, scale: float
+) -> np.ndarray:
+    """Scale a mask around ``anchor`` and place that anchor at ``center``.
+
+    >>> mask = np.zeros((8, 10), dtype=np.uint8); mask[3:5, 4:6] = 255
+    >>> moved = transform_mask(mask, 5, 4, 7, 4, 1)
+    >>> mask_bounding_box(moved)
+    (6, 3, 8, 5)
     """
+    height, width = mask.shape
+    matrix = np.array(
+        [[scale, 0, center_x - scale * anchor_x], [0, scale, center_y - scale * anchor_y]],
+        dtype=np.float32,
+    )
+    return cv2.warpAffine(
+        mask, matrix, (width, height), flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+
+
+def shape_keyframe_expression(motion: MaskMotion, shape_id: str, field: str) -> str:
+    """Build placement expressions for one shape, including its active holds.
+
+    The caller enables the matching overlay only for this shape's intervals.
+    Values outside those intervals are harmless and deliberately unspecified.
+    """
+    base = 1.0 if field == "scale" else motion.anchor(shape_id)[0 if field == "center_x" else 1]
+    expression = f"{base:.12g}"
+    keys = motion.keyframes
+    for index in range(len(keys) - 1, -1, -1):
+        key = keys[index]
+        end = keys[index + 1].frame / motion.fps if index + 1 < len(keys) else None
+        if key.shape_id == shape_id:
+            value = getattr(key, field)
+            following = keys[index + 1] if index + 1 < len(keys) else None
+            if following is not None and following.shape_id == shape_id:
+                following_value = getattr(following, field)
+                start = key.frame / motion.fps
+                segment = f"({value:.12g})+({following_value - value:.12g})*(t-{start:.12g})/{end - start:.12g}"
+            else:
+                segment = f"{value:.12g}"
+        else:
+            segment = expression
+        if end is not None:
+            expression = f"if(lt(t,{end:.12g}),{segment},{expression})"
+        else:
+            expression = segment
+    first_end = keys[0].frame / motion.fps
+    if shape_id == "A":
+        expression = f"if(lt(t,{first_end:.12g}),{base:.12g},{expression})"
+    return expression
+
+
+def shape_enable_expression(motion: MaskMotion, shape_id: str) -> str:
+    """FFmpeg expression selecting the intervals where ``shape_id`` is visible."""
+    keys = motion.keyframes
+    terms: list[str] = []
+    if shape_id == "A" and (not keys or keys[0].frame > 0):
+        if keys:
+            terms.append(f"lt(t,{keys[0].frame / motion.fps:.12g})")
+        else:
+            terms.append("1")
+    for index, key in enumerate(keys):
+        if key.shape_id != shape_id:
+            continue
+        start = key.frame / motion.fps
+        if index + 1 == len(keys):
+            terms.append(f"gte(t,{start:.12g})")
+        else:
+            end = keys[index + 1].frame / motion.fps
+            terms.append(f"gte(t,{start:.12g})*lt(t,{end:.12g})")
+    return "+".join(terms) or "0"
+
+
+def build_filter_complex(sigma: float, pixelize: int, motion: MaskMotion | None = None) -> str:
     chain = []
     if pixelize >= 2:
         chain.append(f"pixelize=w={pixelize}:h={pixelize}")
     if sigma > 0:
         chain.append(f"gblur=sigma={sigma:g}:steps=3")
     chain.append("format=yuva420p")
-    return (
-        "[0:v]split[base][pre];"
-        f"[pre]{','.join(chain)}[blurred];"
-        "[1:v]format=gray[mask];"
-        # The mask is a single still image; framesync repeatlast reuses it for every frame
-        "[blurred][mask]alphamerge[blurred_a];"
-        "[base][blurred_a]overlay=0:0[out]"
-    )
+    if motion is None or not motion.uses_transform:
+        return (
+            "[0:v]split[base][pre];"
+            f"[pre]{','.join(chain)}[blurred];"
+            "[1:v]format=gray[mask];"
+            # The mask is a single still image; framesync repeatlast reuses it for every frame
+            "[blurred][mask]alphamerge[blurred_a];"
+            "[base][blurred_a]overlay=0:0[out]"
+        )
+
+    graph = [
+        "[0:v]split=3[base][pre][maskbase]",
+        f"[pre]{','.join(chain)}[blurred]",
+        # Produce a black canvas from the video so it is always exactly the video size.
+        "[maskbase]format=gray,geq=lum='0'[mask0]",
+    ]
+    mask_label = "mask0"
+    for input_index, shape_id in enumerate(motion.shape_ids(), start=1):
+        x0, y0 = motion.anchor(shape_id)
+        scale = shape_keyframe_expression(motion, shape_id, "scale")
+        center_x = shape_keyframe_expression(motion, shape_id, "center_x")
+        center_y = shape_keyframe_expression(motion, shape_id, "center_y")
+        scaled = f"scaled{input_index}"
+        next_mask = f"mask{input_index}"
+        enabled = shape_enable_expression(motion, shape_id)
+        graph.append(
+            f"[{input_index}:v]format=gray,scale=w='trunc(iw*({scale}))':h='trunc(ih*({scale}))':eval=frame[{scaled}]"
+        )
+        graph.append(
+            f"[{mask_label}][{scaled}]overlay=x='{center_x}-({scale})*{x0:.12g}':"
+            f"y='{center_y}-({scale})*{y0:.12g}':enable='{enabled}':shortest=1[{next_mask}]"
+        )
+        mask_label = next_mask
+    graph.extend([
+        f"[blurred][{mask_label}]alphamerge[blurred_a]",
+        "[base][blurred_a]overlay=0:0[out]",
+    ])
+    return ";".join(graph)
 
 
 def build_ffmpeg_command(
@@ -235,14 +548,21 @@ def build_ffmpeg_command(
     crf: int,
     preset: str,
     progress: bool = False,
+    motion: MaskMotion | None = None,
+    shape_paths: dict[str, pathlib.Path] | None = None,
 ) -> list[str]:
     command = ["ffmpeg", "-hide_banner", "-y"]
     if progress:
         command += ["-nostats", "-progress", "pipe:1"]
+    command += ["-i", str(input_path)]
+    shape_paths = shape_paths or {"A": mask_path}
+    if motion is not None and motion.uses_transform:
+        for shape_id in motion.shape_ids():
+            command += ["-loop", "1", "-framerate", f"{motion.fps:.12g}", "-i", str(shape_paths[shape_id])]
+    else:
+        command += ["-i", str(mask_path)]
     command += [
-        "-i", str(input_path),
-        "-i", str(mask_path),
-        "-filter_complex", build_filter_complex(sigma, pixelize),
+        "-filter_complex", build_filter_complex(sigma, pixelize, motion),
         "-map", "[out]",
         "-map", "0:a?",
         "-c:v", "libx264",
@@ -453,7 +773,53 @@ class EncodeJob(QtCore.QObject):
 
 
 class SeekSlider(QtWidgets.QSlider):
-    """A slider that jumps straight to the clicked position instead of paging."""
+    """A slider that jumps straight to the clicked position instead of paging.
+
+    It also draws a tick for every keyframe, so the timing of the mask can be
+    read from the timeline without opening the table.
+    """
+
+    MARKER_COLOR = QtGui.QColor(255, 140, 0, 220)
+
+    def __init__(self, orientation: Qt.Orientation, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(orientation, parent)
+        self.markers: list[int] = []
+        self.setMinimumHeight(22)
+
+    def set_markers(self, values: t.Iterable[int]) -> None:
+        markers = sorted(set(values))
+        if markers != self.markers:
+            self.markers = markers
+            self.update()
+
+    def marker_x(self, value: int) -> int:
+        option = QtWidgets.QStyleOptionSlider()
+        self.initStyleOption(option)
+        style = self.style()
+        groove = style.subControlRect(QtWidgets.QStyle.ComplexControl.CC_Slider, option, QtWidgets.QStyle.SubControl.SC_SliderGroove, self)
+        handle = style.subControlRect(QtWidgets.QStyle.ComplexControl.CC_Slider, option, QtWidgets.QStyle.SubControl.SC_SliderHandle, self)
+        span = max(1, groove.width() - handle.width())
+        offset = QtWidgets.QStyle.sliderPositionFromValue(self.minimum(), self.maximum(), value, span, option.upsideDown)
+        return groove.x() + handle.width() // 2 + offset
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        super().paintEvent(event)
+        if not self.markers:
+            return
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(self.MARKER_COLOR)
+        bottom = self.height()
+        for value in self.markers:
+            x = self.marker_x(value)
+            painter.drawPolygon(QtGui.QPolygonF([
+                QtCore.QPointF(x, bottom - 7),
+                QtCore.QPointF(x - 5, bottom),
+                QtCore.QPointF(x + 5, bottom),
+            ]))
+            painter.drawRect(QtCore.QRectF(x - 0.5, 0, 1.0, bottom - 7))
+        painter.end()
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
@@ -634,6 +1000,18 @@ class PaintWindow(QtWidgets.QMainWindow):
 
         self.painter = MaskPainter(self.video_w, self.video_h, mask_path)
         self.loaded_existing = self.painter.load()
+        self.motion_path = default_motion_path(mask_path)
+        self.motion = MaskMotion.load(self.motion_path, self.video_w, self.video_h, self.fps)
+        self.shape_painters: dict[str, MaskPainter] = {"A": self.painter}
+        for shape_id, path in motion_shape_paths(self.motion, mask_path).items():
+            if shape_id == "A":
+                continue
+            painter = MaskPainter(self.video_w, self.video_h, path)
+            painter.load()
+            self.shape_painters[shape_id] = painter
+        self.active_shape_id = "A"
+        self.motion_unsaved = False
+        self.motion_version = 0
 
         self.current_frame_index = 0
         self.current_seconds = 0.0
@@ -645,10 +1023,12 @@ class PaintWindow(QtWidgets.QMainWindow):
         self.last_point: tuple[int, int] | None = None
         self.encode_job: EncodeJob | None = None
         self._frame_buffer: np.ndarray | None = None  # keeps the QImage data alive
-        self._mask_cache: tuple[int, int, int] | None = None
+        self._mask_cache: tuple[t.Any, ...] | None = None
         self._mask3: np.ndarray | None = None
         self._mask_bbox: tuple[int, int, int, int] | None = None
-        self._coverage_cache = (-1, 0.0)
+        self._paint_mask_cache: tuple[t.Any, ...] | None = None
+        self._paint_mask3: np.ndarray | None = None
+        self._coverage_cache: tuple[tuple[str, int] | int, float] = (-1, 0.0)
         self._latest_frame = None
 
         self.player = QMediaPlayer(self)
@@ -676,7 +1056,8 @@ class PaintWindow(QtWidgets.QMainWindow):
         start_frame = resolve_frame_index(initial_time, self.fps, self.frame_count) if self.frame_count else 0
         self.goto_frame(start_frame)
         self.set_status(
-            "loaded the existing mask" if self.loaded_existing
+            "loaded the existing mask and motion" if self.loaded_existing and self.motion.keyframes
+            else "loaded the existing mask" if self.loaded_existing
             else "left drag = blur pen / right drag = eraser / wheel = pen size"
         )
 
@@ -722,6 +1103,42 @@ class PaintWindow(QtWidgets.QMainWindow):
         self.pixelize_slider = self._make_slider(0, 80, pixelize)
         self.pixelize_slider.valueChanged.connect(self.render_frame)
 
+        self.shape_box = QtWidgets.QComboBox()
+        self.shape_box.currentIndexChanged.connect(self.on_shape_selected)
+        self.new_shape_button = QtWidgets.QPushButton("New shape")
+        self.new_shape_button.setToolTip("Create a separately paintable shape and select it")
+        self.new_shape_button.clicked.connect(self.add_shape)
+        self.delete_shape_button = QtWidgets.QPushButton("Delete shape")
+        self.delete_shape_button.clicked.connect(self.delete_shape)
+
+        self.motion_add_button = QtWidgets.QPushButton()  # lives in the last table row; rebuilt on refresh
+        self.motion_hint_label = QtWidgets.QLabel()
+        self.motion_hint_label.setWordWrap(True)
+        self.motion_hint_label.setStyleSheet("color: palette(placeholder-text);")
+        self.motion_key_table = QtWidgets.QTableWidget(0, len(KEY_COLUMNS))
+        self.motion_key_table.setHorizontalHeaderLabels(KEY_COLUMNS)
+        self.motion_key_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.motion_key_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.motion_key_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed)
+        self.motion_key_table.setAlternatingRowColors(True)
+        self.motion_key_table.setToolTip(
+            "Click a row to seek to it; its delete button appears at the right (Delete key also works).\n"
+            "X / Y / Scale change in place; double-click Frame or Time to retime the key."
+        )
+        self.motion_key_table.itemChanged.connect(self.on_motion_table_item_changed)
+        self.motion_key_table.itemSelectionChanged.connect(self.on_motion_table_selected)
+        self.motion_key_table.verticalHeader().setVisible(False)
+        header = self.motion_key_table.horizontalHeader()
+        header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(KEY_COLUMN_SHAPE, QtWidgets.QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(KEY_COLUMN_SHAPE, 120)
+        header.setSectionResizeMode(KEY_COLUMN_DELETE, QtWidgets.QHeaderView.ResizeMode.Stretch)  # keeps the bin beside the values
+        self.motion_key_table.setMaximumHeight(220)
+        QtGui.QShortcut(
+            QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Delete), self.motion_key_table,
+            context=Qt.ShortcutContext.WidgetShortcut, activated=lambda: self.delete_motion_keyframe(),
+        )
+
         undo_button = QtWidgets.QPushButton("Undo")
         undo_button.clicked.connect(self.do_undo)
         redo_button = QtWidgets.QPushButton("Redo")
@@ -761,6 +1178,13 @@ class PaintWindow(QtWidgets.QMainWindow):
             save_button, self.encode_button, self.cancel_button, None,
             QtWidgets.QLabel("crf"), self.crf_box, self.progress,
         )
+        self.paint_shape_label = QtWidgets.QLabel("Paint shape")
+        shape_row = self._make_row(
+            self.paint_shape_label, self.shape_box, self.new_shape_button, self.delete_shape_button,
+        )
+        shape_row.addStretch(1)
+        key_row = self._make_row(QtWidgets.QLabel("Keyframes"), None, self.motion_hint_label)
+        key_row.setStretch(key_row.count() - 1, 1)
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
@@ -769,13 +1193,19 @@ class PaintWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.timeline)
         layout.addLayout(row1)
         layout.addLayout(row2)
+        layout.addLayout(shape_row)
+        layout.addLayout(key_row)
+        layout.addWidget(self.motion_key_table)
         layout.addLayout(row3)
         self.setCentralWidget(central)
 
         self.position_label = QtWidgets.QLabel()
         self.position_label.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont))
         self.statusBar().addPermanentWidget(self.position_label)
-        self.statusBar().addPermanentWidget(QtWidgets.QLabel(f"mask: {self.mask_path}"))
+        mask_label = QtWidgets.QLabel(f"mask: {self.mask_path.name}")
+        mask_label.setToolTip(str(self.mask_path))
+        self.statusBar().addPermanentWidget(mask_label)
+        self.refresh_motion_keyframes()
 
     def _make_slider(self, minimum: int, maximum: int, value: int) -> QtWidgets.QSlider:
         slider = QtWidgets.QSlider(Qt.Orientation.Horizontal)
@@ -834,6 +1264,7 @@ class PaintWindow(QtWidgets.QMainWindow):
         self.current_bgr = frame
         self.render_frame()
         self.sync_timeline()
+        self.select_keyframe_row(frame_index)
 
     def sync_timeline(self) -> None:
         self.timeline.blockSignals(True)
@@ -902,15 +1333,49 @@ class PaintWindow(QtWidgets.QMainWindow):
     # -- rendering -------------------------------------------------------
 
     def scaled_mask(self, width: int, height: int) -> tuple[np.ndarray, tuple[int, int, int, int] | None]:
-        """Return the 3ch float mask at display size and its bounding box (refreshed on every stroke)."""
-        key = (self.painter.version, width, height)
+        """Return the current-frame mask at display size and its bounding box."""
+        shape_id = self.motion.shape_at_frame(self.current_frame_index)
+        painter = self.shape_painters[shape_id]
+        center_x, center_y, scale = self.motion.transform_at_frame(self.current_frame_index)
+        key = (shape_id, painter.version, self.motion_version, width, height, center_x, center_y, scale)
         if self._mask_cache != key or self._mask3 is None:
-            small = cv2.resize(self.painter.mask, (width, height), interpolation=cv2.INTER_LINEAR)
+            small = cv2.resize(painter.mask, (width, height), interpolation=cv2.INTER_LINEAR)
+            if self.motion.uses_transform:
+                anchor_x, anchor_y = self.motion.anchor(shape_id)
+                small = transform_mask(
+                    small,
+                    anchor_x * width / self.video_w, anchor_y * height / self.video_h,
+                    center_x * width / self.video_w, center_y * height / self.video_h, scale,
+                )
             normalized = small.astype(np.float32) / 255.0
             self._mask3 = cv2.merge([normalized, normalized, normalized])
             self._mask_bbox = mask_bounding_box(small)
             self._mask_cache = key
         return self._mask3, self._mask_bbox
+
+    def paint_shape_overlay(self, width: int, height: int) -> np.ndarray | None:
+        """Return the active source shape when its output placement differs.
+
+        Painting always changes source-mask pixels.  Show that source in cyan
+        when the current keyframe uses another shape, or moves/scales this one,
+        so a brush stroke cannot appear to do nothing.
+        """
+        output_shape_id = self.motion.shape_at_frame(self.current_frame_index)
+        center_x, center_y, scale = self.motion.transform_at_frame(self.current_frame_index)
+        anchor_x, anchor_y = self.motion.anchor(self.active_shape_id)
+        if (
+            output_shape_id == self.active_shape_id
+            and (center_x, center_y, scale) == (anchor_x, anchor_y, 1.0)
+        ):
+            return None
+        painter = self.shape_painters[self.active_shape_id]
+        key = (self.active_shape_id, painter.version, width, height)
+        if self._paint_mask_cache != key or self._paint_mask3 is None:
+            small = cv2.resize(painter.mask, (width, height), interpolation=cv2.INTER_LINEAR)
+            normalized = small.astype(np.float32) / 255.0 * 0.55
+            self._paint_mask3 = cv2.merge([normalized, normalized, normalized])
+            self._paint_mask_cache = key
+        return self._paint_mask3
 
     def display_size(self) -> tuple[int, int]:
         """Device resolution, never upscaled; Qt stretches the result if the widget is larger."""
@@ -944,6 +1409,17 @@ class PaintWindow(QtWidgets.QMainWindow):
                 merged = blend(merged, tint, region * 0.35)
             shown[y0:y1, x0:x1] = merged
 
+        # The cyan source layer is intentionally independent of keyframe
+        # placement: pointer coordinates map directly to its mask pixels.
+        paint_mask = self.paint_shape_overlay(width, height)
+        if paint_mask is not None:
+            cyan = np.empty_like(shown)
+            cyan[:, :] = (255, 255, 0)
+            shown = blend(shown, cyan, paint_mask)
+        self.paint_shape_label.setText(
+            "Paint shape (cyan source)" if paint_mask is not None else "Paint shape"
+        )
+
         self._frame_buffer = np.ascontiguousarray(shown)  # QImage does not copy the data
         image = QtGui.QImage(
             self._frame_buffer.data, width, height,
@@ -954,13 +1430,23 @@ class PaintWindow(QtWidgets.QMainWindow):
 
     def update_labels(self) -> None:
         seconds = self.current_seconds
-        if self._coverage_cache[0] != self.painter.version:
-            self._coverage_cache = (self.painter.version, self.painter.coverage())
+        coverage_key = (self.active_shape_id, self.painter.version)
+        if self._coverage_cache[0] != coverage_key:
+            self._coverage_cache = (coverage_key, self.painter.coverage())
         self.position_label.setText(
             f"{seconds:7.2f}s / {self.duration:.2f}s  frame {self.current_frame_index}/{max(0, self.frame_count - 1)}"
-            f"   pen r={self.pen_slider.value()}  mask {self._coverage_cache[1] * 100:4.1f}%"
-            f"{'  *unsaved' if self.painter.unsaved else ''}"
+            f"   pen r={self.pen_slider.value()}  shape {self.active_shape_id} {self._coverage_cache[1] * 100:4.1f}%"
+            f"{'  ' + str(len(self.motion.keyframes)) + ' keyframes' if self.motion.keyframes else ''}"
+            f"{'  *unsaved' if any(p.unsaved for p in self.shape_painters.values()) or self.motion_unsaved else ''}"
         )
+        on_key = self.motion.keyframe_at(self.current_frame_index) is not None
+        add_text = (
+            f"＋  Add key at {seconds:.2f}s (frame {self.current_frame_index}) using shape {self.active_shape_id}"
+            if not on_key else f"frame {self.current_frame_index} already has a key; seek elsewhere to add another"
+        )
+        if self.motion_add_button.text() != add_text:
+            self.motion_add_button.setText(add_text)
+            self.motion_add_button.setEnabled(not on_key)
 
     def set_status(self, text: str) -> None:
         self.statusBar().showMessage(text)
@@ -1036,25 +1522,310 @@ class PaintWindow(QtWidgets.QMainWindow):
             self.render_frame()
             self.update_labels()
 
-    # -- mask save / encode ----------------------------------------------
+    # -- mask keyframes --------------------------------------------------
 
-    def autosave(self) -> None:
-        if not self.painter.unsaved or self.painting:
+    def refresh_shapes(self, selected_shape_id: str | None = None) -> None:
+        selected_shape_id = selected_shape_id or self.active_shape_id
+        self.shape_box.blockSignals(True)
+        self.shape_box.clear()
+        for shape_id in self.motion.shape_ids():
+            self.shape_box.addItem(f"Shape {shape_id}", shape_id)
+        index = self.shape_box.findData(selected_shape_id)
+        self.shape_box.setCurrentIndex(max(0, index))
+        self.shape_box.blockSignals(False)
+        self.delete_shape_button.setEnabled(selected_shape_id != "A")
+
+    def on_shape_selected(self) -> None:
+        shape_id = self.shape_box.currentData()
+        if shape_id is None or shape_id == self.active_shape_id:
+            return
+        self.active_shape_id = str(shape_id)
+        self.painter = self.shape_painters[self.active_shape_id]
+        self._coverage_cache = (-1, 0.0)
+        self.render_frame()
+        self.update_labels()
+        self.set_status(f"editing shape {self.active_shape_id}; keyframe rows choose which shape is used")
+
+    def add_shape(self) -> None:
+        shape_id = next((letter for letter in string.ascii_uppercase if letter not in self.shape_painters), None)
+        if shape_id is None:
+            self.set_status("no free shape letter left")
+            return
+        filename = default_shape_path(self.mask_path, shape_id).name
+        self.motion.set_shape(shape_id, filename, self.video_w / 2, self.video_h / 2)
+        self.shape_painters[shape_id] = MaskPainter(self.video_w, self.video_h, self.mask_path.parent / filename)
+        self._touch_motion()
+        self.refresh_shapes(shape_id)
+        self.on_shape_selected()
+        self.set_status(
+            f"created shape {shape_id}; draw the cyan source mask, then add a keyframe to use it"
+        )
+
+    def delete_shape(self) -> None:
+        shape_id = self.active_shape_id
+        if shape_id == "A":
+            return
+        if any(key.shape_id == shape_id for key in self.motion.keyframes):
+            self.set_status(f"shape {shape_id} is assigned to a keyframe; choose another shape in that row first")
+            return
+        del self.shape_painters[shape_id]
+        del self.motion.shapes[shape_id]
+        self.active_shape_id = "A"
+        self.painter = self.shape_painters["A"]
+        self._touch_motion()
+        self.refresh_shapes("A")
+        self.render_frame()
+        self.update_labels()
+        self.set_status(f"removed unused shape {shape_id}")
+
+    def selected_motion_keyframe(self) -> MaskKeyframe | None:
+        rows = self.motion_key_table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        item = self.motion_key_table.item(rows[0].row(), KEY_COLUMN_FRAME)
+        return None if item is None else self.motion.keyframe_at(int(item.data(Qt.ItemDataRole.UserRole)))
+
+    def refresh_motion_keyframes(self, selected_frame: int | None = None) -> None:
+        """Rebuild the table while preserving the selected source frame."""
+        if selected_frame is None:
+            selected = self.selected_motion_keyframe()
+            selected_frame = None if selected is None else selected.frame
+        self.refresh_shapes()
+        table = self.motion_key_table
+        table.blockSignals(True)
+        table.clearSpans()
+        for row in range(table.rowCount()):
+            table.removeCellWidget(row, KEY_COLUMN_FRAME)  # the previous "+" button
+        table.setRowCount(len(self.motion.keyframes) + 1)  # the extra row holds the "+" button
+        for row, key in enumerate(self.motion.keyframes):
+            for column, value in ((KEY_COLUMN_FRAME, str(key.frame)), (KEY_COLUMN_TIME, f"{key.frame / self.fps:.6g}")):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, key.frame)
+                item.setToolTip("Double-click to retime this key")
+                table.setItem(row, column, item)
+            chooser = QtWidgets.QComboBox()
+            for shape_id in self.motion.shape_ids():
+                chooser.addItem(f"Shape {shape_id}", shape_id)
+            chooser.setCurrentIndex(chooser.findData(key.shape_id))
+            chooser.setToolTip("Shape shown from this key on")
+            chooser.currentIndexChanged.connect(lambda _index, frame=key.frame, box=chooser: self.on_motion_table_shape_changed(frame, box))
+            table.setCellWidget(row, KEY_COLUMN_SHAPE, self._as_key_cell(chooser, key.frame))
+            for column, field, value, limit in (
+                (KEY_COLUMN_X, "center_x", key.center_x, self.video_w),
+                (KEY_COLUMN_Y, "center_y", key.center_y, self.video_h),
+                (KEY_COLUMN_SCALE, "scale", key.scale, None),
+            ):
+                box = QtWidgets.QDoubleSpinBox()
+                if limit is None:
+                    box.setRange(0.05, 8.0)
+                    box.setSingleStep(0.05)
+                    box.setDecimals(2)
+                    box.setSuffix(" x")
+                    box.setToolTip("Size relative to the painted shape")
+                else:
+                    box.setRange(-limit, limit * 2)
+                    box.setSingleStep(1.0)
+                    box.setDecimals(1)
+                    box.setSuffix(" px")
+                    box.setToolTip("Centre of the shape at this key")
+                box.setValue(value)
+                box.valueChanged.connect(lambda number, frame=key.frame, field=field: self.on_motion_table_value_changed(frame, field, number))
+                table.setCellWidget(row, column, self._as_key_cell(box, key.frame))
+            if key.frame == selected_frame:
+                table.selectRow(row)
+        add_row = len(self.motion.keyframes)
+        placeholder = QtWidgets.QTableWidgetItem()
+        placeholder.setFlags(Qt.ItemFlag.NoItemFlags)  # the "+" row is not a key: never selectable
+        table.setItem(add_row, KEY_COLUMN_FRAME, placeholder)
+        table.setSpan(add_row, KEY_COLUMN_FRAME, 1, len(KEY_COLUMNS))
+        self.motion_add_button = QtWidgets.QPushButton()
+        self.motion_add_button.setFlat(True)
+        self.motion_add_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.motion_add_button.setStyleSheet("text-align: left; padding: 2px 8px;")
+        self.motion_add_button.clicked.connect(self.add_motion_keyframe)
+        table.setCellWidget(add_row, KEY_COLUMN_FRAME, self.motion_add_button)
+        table.blockSignals(False)
+        self.update_motion_table_delete_buttons(selected_frame)
+        self.timeline.set_markers(key.frame for key in self.motion.keyframes)
+        self.motion_hint_label.setText(
+            "No keys: the mask stays where it is painted. Seek, then add a key to move, resize, or switch shapes from that time."
+            if not self.motion.keyframes else
+            "Click a row to seek. X / Y / Scale change in place; double-click Frame or Time to retime. Delete removes the selected key."
+        )
+        self.update_labels()
+        self.render_frame()
+
+    def _as_key_cell(self, widget: QtWidgets.QWidget, frame: int) -> QtWidgets.QWidget:
+        """Cell widgets swallow clicks, so select their row on focus and ignore stray wheel input."""
+        widget.setProperty("keyframe", frame)
+        widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        widget.installEventFilter(self)
+        return widget
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        frame = obj.property("keyframe") if isinstance(obj, QtWidgets.QWidget) else None
+        if frame is not None:
+            if event.type() == QtCore.QEvent.Type.Wheel and not obj.hasFocus():
+                return True
+            if event.type() == QtCore.QEvent.Type.FocusIn:
+                self.select_keyframe_row(int(frame))
+        return super().eventFilter(obj, event)
+
+    def select_keyframe_row(self, frame: int) -> None:
+        selected = self.selected_motion_keyframe()
+        if selected is not None and selected.frame == frame:
+            return
+        for row, key in enumerate(self.motion.keyframes):
+            if key.frame == frame:
+                self.motion_key_table.selectRow(row)
+                return
+
+    def update_motion_table_delete_buttons(self, selected_frame: int | None = None) -> None:
+        """Show the destructive action only beside the selected keyframe row."""
+        if selected_frame is None:
+            key = self.selected_motion_keyframe()
+            selected_frame = None if key is None else key.frame
+        for row, key in enumerate(self.motion.keyframes):
+            self.motion_key_table.removeCellWidget(row, KEY_COLUMN_DELETE)
+            if key.frame != selected_frame:
+                continue
+            button = QtWidgets.QToolButton()
+            button.setAutoRaise(True)
+            button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_TrashIcon))
+            button.setIconSize(QtCore.QSize(16, 16))
+            button.setToolTip(f"Delete keyframe at frame {key.frame}")
+            button.setAccessibleName(f"Delete keyframe at frame {key.frame}")
+            button.clicked.connect(lambda _checked=False, target=key: self.delete_motion_keyframe(target))
+            cell = QtWidgets.QWidget()
+            cell_layout = QtWidgets.QHBoxLayout(cell)
+            cell_layout.setContentsMargins(2, 0, 0, 0)
+            cell_layout.addWidget(button)
+            cell_layout.addStretch(1)
+            self.motion_key_table.setCellWidget(row, KEY_COLUMN_DELETE, cell)
+
+    def on_motion_table_selected(self) -> None:
+        key = self.selected_motion_keyframe()
+        if key is None:
+            return
+        if key.frame != self.current_frame_index:
+            self.stop_playback()
+            self.goto_frame(key.frame)
+        self.update_motion_table_delete_buttons(key.frame)
+
+    def _touch_motion(self) -> None:
+        self.motion_unsaved = True
+        self.motion_version += 1
+
+    def on_motion_table_shape_changed(self, frame: int, box: QtWidgets.QComboBox) -> None:
+        key = self.motion.keyframe_at(frame)
+        if key is None:
+            return
+        key.shape_id = str(box.currentData())
+        self._touch_motion()
+        self.refresh_motion_keyframes(key.frame)
+
+    def on_motion_table_value_changed(self, frame: int, field: str, value: float) -> None:
+        """X / Y / Scale edits apply live without rebuilding the row being edited."""
+        key = self.motion.keyframe_at(frame)
+        if key is None:
+            return
+        setattr(key, field, float(value))
+        self._touch_motion()
+        self.render_frame()
+        self.update_labels()
+
+    def on_motion_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
+        frame = item.data(Qt.ItemDataRole.UserRole)
+        if frame is None:
+            return
+        key = self.motion.keyframe_at(int(frame))
+        if key is None:
             return
         try:
-            self.painter.save()
-            self.set_status(f"autosave: {self.mask_path}")
+            if item.column() == KEY_COLUMN_FRAME:
+                value = int(item.text())
+            elif item.column() == KEY_COLUMN_TIME:
+                value = round(float(item.text()) * self.fps)
+            else:
+                return
+            if value < 0 or (value != key.frame and self.motion.keyframe_at(value) is not None):
+                raise ValueError
+        except ValueError:
+            self.set_status("frame/time must be unique and non-negative")
+        else:
+            key.frame = value
+            self.motion.sort_keyframes()
+            self._touch_motion()
+        self.refresh_motion_keyframes(key.frame)
+
+    def add_motion_keyframe(self) -> None:
+        self.stop_playback()
+        bbox = mask_bounding_box(self.painter.mask)
+        if bbox is None:
+            self.set_status(f"draw shape {self.active_shape_id} before adding a keyframe")
+            return
+        existing = self.motion.keyframe_at(self.current_frame_index)
+        if existing is not None:
+            self.refresh_motion_keyframes(existing.frame)
+            self.set_status(f"selected existing keyframe at {self.current_seconds:.2f}s")
+            return
+        if not any(key.shape_id == self.active_shape_id for key in self.motion.keyframes):
+            # The first key of a shape anchors it at the centre of what was painted.
+            shape = self.motion.shapes[self.active_shape_id]
+            shape.anchor_x, shape.anchor_y = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+        if self.motion.shape_at_frame(self.current_frame_index) == self.active_shape_id:
+            center_x, center_y, scale = self.motion.transform_at_frame(self.current_frame_index)
+        else:
+            (center_x, center_y), scale = self.motion.anchor(self.active_shape_id), 1.0
+        key = MaskKeyframe(self.current_frame_index, center_x, center_y, scale, self.active_shape_id)
+        self.motion.keyframes.append(key)
+        self.motion.sort_keyframes()
+        self._touch_motion()
+        self.refresh_motion_keyframes(key.frame)
+        self.set_status(
+            f"added keyframe at {self.current_seconds:.2f}s; adjust centre and scale in its row, or add the next keyframe"
+        )
+
+    def delete_motion_keyframe(self, key: MaskKeyframe | None = None) -> None:
+        key = key or self.selected_motion_keyframe()
+        if key is None or key not in self.motion.keyframes:
+            return
+        index = self.motion.keyframes.index(key)
+        self.motion.keyframes.remove(key)
+        self._touch_motion()
+        selected_frame = self.motion.keyframes[min(index, len(self.motion.keyframes) - 1)].frame if self.motion.keyframes else None
+        self.refresh_motion_keyframes(selected_frame)
+        self.set_status(f"deleted keyframe at frame {key.frame}")
+
+    # -- mask save / encode ----------------------------------------------
+
+    def save_state(self, snapshot: bool = False) -> pathlib.Path | None:
+        snapshot_path = None
+        for shape_id, painter in self.shape_painters.items():
+            saved_snapshot = painter.save(snapshot=snapshot)
+            if shape_id == "A":
+                snapshot_path = saved_snapshot
+        self.motion.save(self.motion_path)
+        self.motion_unsaved = False
+        return snapshot_path
+
+    def autosave(self) -> None:
+        if (not any(painter.unsaved for painter in self.shape_painters.values()) and not self.motion_unsaved) or self.painting:
+            return
+        try:
+            self.save_state()
+            self.set_status(f"autosave: {self.mask_path} and {self.motion_path.name}")
         except OSError as exc:
             self.set_status(f"autosave failed: {exc}")
         self.update_labels()
 
     def save_mask(self) -> None:
         try:
-            snapshot = self.painter.save(snapshot=True)
+            snapshot = self.save_state(snapshot=True)
         except OSError as exc:
             self.set_status(f"save failed: {exc}")
             return
-        self.set_status(f"saved: {self.mask_path}  (backup: {snapshot.name if snapshot else '-'})")
+        self.set_status(f"saved: {self.mask_path} and {self.motion_path.name}  (backup: {snapshot.name if snapshot else '-'})")
         self.update_labels()
 
     def start_encode(self) -> None:
@@ -1068,14 +1839,14 @@ class PaintWindow(QtWidgets.QMainWindow):
             return
         self.output_path = pathlib.Path(selected)
         try:
-            self.painter.save(snapshot=True)
+            self.save_state(snapshot=True)
         except OSError as exc:
             self.set_status(f"save failed: {exc}")
             return
         command = build_ffmpeg_command(
             self.video_path, self.mask_path, self.output_path,
             self.sigma_slider.value(), self.pixelize_slider.value(), self.crf_box.value(), self.preset,
-            progress=True,
+            progress=True, motion=self.motion, shape_paths=motion_shape_paths(self.motion, self.mask_path),
         )
         logger.info("%s", shlex.join(command))
         self.encode_job = EncodeJob(command, self.duration, self)
@@ -1121,9 +1892,9 @@ class PaintWindow(QtWidgets.QMainWindow):
                 event.ignore()
                 return
             self.encode_job.cancel()
-        if self.painter.unsaved:
+        if any(painter.unsaved for painter in self.shape_painters.values()) or self.motion_unsaved:
             try:
-                self.painter.save()
+                self.save_state()
             except OSError as exc:
                 logger.error("failed to save mask: %s", exc)
         self.stop_playback()
@@ -1167,14 +1938,23 @@ def encode(args: argparse.Namespace) -> int:
         return 1
     mask_path = pathlib.Path(args.mask) if args.mask else default_mask_path(input_path)
     output_path = pathlib.Path(args.output) if args.output else default_output_path(input_path)
+    cap = cv2.VideoCapture(str(input_path))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+    motion = MaskMotion.load(default_motion_path(mask_path), width, height, fps)
+    shape_paths = motion_shape_paths(motion, mask_path)
     command = build_ffmpeg_command(
-        input_path, mask_path, output_path, args.sigma, args.pixelize, args.crf, args.preset
+        input_path, mask_path, output_path, args.sigma, args.pixelize, args.crf, args.preset,
+        motion=motion, shape_paths=shape_paths,
     )
     if args.print_command:
         print(shlex.join(command))
         return 0
-    if not mask_path.exists():
-        print(f"mask not found: {mask_path}", file=sys.stderr)
+    missing = [path for path in shape_paths.values() if not path.exists()]
+    if missing:
+        print(f"mask not found: {missing[0]}", file=sys.stderr)
         return 1
     logger.info("%s", shlex.join(command))
     return subprocess.run(command).returncode
@@ -1226,6 +2006,22 @@ def main() -> int:
 
 
 def test_build_filter_complex():
+    graph = build_filter_complex(26, 0)
+    assert "gblur=sigma=26" in graph
+    # A black mask preserves the input; white exposes the blurred edge.
+    # Exercise the connections in FFmpeg without fixing internal graph labels.
+    command = ["ffmpeg", "-v", "error", "-filter_complex_threads", "1",
+               "-f", "lavfi", "-i", "color=white:s=32x32,drawbox=x=0:y=0:w=16:h=32:color=black:t=fill",
+               "-f", "lavfi", "-i", "color=black:s=32x32,drawbox=color=white:t=fill:enable='eq(n,1)'",
+               "-filter_complex", graph, "-map", "[out]", "-frames:v", "2",
+               "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+    logger.debug("%s", shlex.join(command))
+    result = subprocess.run(command, check=True, capture_output=True)
+    frames = np.frombuffer(result.stdout, dtype=np.uint8).reshape(2, 32, 32, 3)
+    assert np.all(frames[0, :, :16] == 0)
+    assert np.all(frames[0, :, 16:] == 255)
+    assert np.all(frames[1, :, 15] > 0)
+    assert np.all(frames[1, :, 16] < 255)
     assert "pixelize=w=24:h=24" in build_filter_complex(10, 24)
     assert "pixelize" not in build_filter_complex(10, 0)
     assert "gblur" not in build_filter_complex(0, 24)
@@ -1238,6 +2034,137 @@ def test_build_ffmpeg_command():
     assert command[-1] == "o.mp4"
     assert command.count("-i") == 2
     assert "-progress" not in command
+
+
+def test_mask_motion_persistence_and_transform(tmp_path):
+    motion = MaskMotion(100, 50, 25, keyframes=[
+        MaskKeyframe(25, 50, 25, 1.0),
+        MaskKeyframe(75, 80, 15, 1.5),
+        MaskKeyframe(100, 80, 15, 1.5),
+        MaskKeyframe(125, 20, 35, 0.75),
+    ])
+    assert motion.transform_at_frame(0) == (50, 25, 1.0)
+    assert motion.transform_at_frame(50) == (65, 20, 1.25)
+    assert motion.transform_at_frame(90) == (80, 15, 1.5)  # B hold
+    assert motion.transform_at_frame(150) == (20, 35, 0.75)
+    path = tmp_path / "m.mask.motion.json"
+    motion.save(path)
+    loaded = MaskMotion.load(path, 200, 100, 25)
+    assert loaded.transform_at_frame(50) == (130, 40, 1.25)  # A -> B
+    assert loaded.transform_at_frame(90) == (160, 30, 1.5)  # B hold
+    assert loaded.to_dict()["version"] == 3
+    assert default_motion_path(tmp_path / "m.mask.png") == path
+
+
+def test_loads_version_1_motion_as_two_keyframes(tmp_path):
+    path = tmp_path / "old.motion.json"
+    path.write_text(json.dumps({
+        "version": 1, "video_size": [100, 50], "fps": 25,
+        "start_frame": 25, "end_frame": 75, "anchor": [50, 25],
+        "end_center": [80, 15], "end_scale": 1.5,
+    }), encoding="utf-8")
+    loaded = MaskMotion.load(path, 100, 50, 25)
+    assert [(key.frame, key.center_x, key.center_y, key.scale) for key in loaded.keyframes] == [
+        (25, 50, 25, 1.0), (75, 80, 15, 1.5),
+    ]
+    assert loaded.transform_at_frame(50) == (65, 20, 1.25)
+
+
+def test_multiple_shapes_switch_at_the_keyframe_and_persist(tmp_path):
+    motion = MaskMotion(100, 50, 10)
+    motion.set_shape("A", "", 20, 25)
+    motion.set_shape("B", "m.mask.shape-B.png", 80, 25)
+    motion.keyframes = [
+        MaskKeyframe(10, 20, 25, 1.0, "A"),
+        MaskKeyframe(20, 50, 25, 1.5, "A"),
+        MaskKeyframe(30, 80, 25, 1.0, "B"),
+    ]
+    assert motion.shape_at_frame(29) == "A"
+    assert motion.shape_at_frame(30) == "B"
+    assert motion.transform_at_frame(15) == (35, 25, 1.25)
+    assert motion.transform_at_frame(25) == (50, 25, 1.5)  # A holds before B's instant switch
+    assert motion.transform_at_frame(30) == (80, 25, 1.0)
+    path = tmp_path / "m.mask.motion.json"
+    motion.save(path)
+    loaded = MaskMotion.load(path, 200, 100, 10)
+    assert loaded.shape_at_frame(29) == "A"
+    assert loaded.shape_at_frame(30) == "B"
+    assert loaded.anchor("B") == (160, 50)
+    assert motion_shape_paths(loaded, tmp_path / "m.mask.png")["B"] == tmp_path / "m.mask.shape-B.png"
+    graph = build_filter_complex(3, 0, motion)
+    assert "gte(t,3)" in graph and "[2:v]format=gray" in graph
+
+
+def test_build_motion_filter_and_command():
+    motion = MaskMotion(100, 50, 25, keyframes=[
+        MaskKeyframe(25, 50, 25), MaskKeyframe(75, 80, 15, 1.5),
+        MaskKeyframe(100, 80, 15, 1.5), MaskKeyframe(125, 20, 35, 0.75),
+    ])
+    graph = build_filter_complex(26, 0, motion)
+    assert "split=3" in graph
+    assert "scale=w=" in graph
+    assert "overlay=x=" in graph
+    assert "(t-1)/2" in graph and "(t-3)/1" in graph and "(t-4)/1" in graph
+    command = build_ffmpeg_command(
+        pathlib.Path("a.mp4"), pathlib.Path("m.png"), pathlib.Path("o.mp4"), 26, 0, 20, "slow", motion=motion
+    )
+    assert command[command.index("-loop") + 1] == "1"
+    assert "-framerate" in command
+
+
+def test_motion_filter_encodes_a_video(tmp_path):
+    input_path = tmp_path / "input.mp4"
+    mask_path = tmp_path / "mask.png"
+    output_path = tmp_path / "output.mp4"
+    source = [
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=32x32:r=10:d=1",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(input_path),
+    ]
+    logger.debug("%s", shlex.join(source))
+    subprocess.run(source, check=True, capture_output=True)
+    mask = np.zeros((32, 32), dtype=np.uint8)
+    mask[10:22, 4:16] = 255
+    assert cv2.imwrite(str(mask_path), mask)
+    motion = MaskMotion(32, 32, 10, keyframes=[
+        MaskKeyframe(2, 10, 16), MaskKeyframe(4, 24, 16, 1.25),
+        MaskKeyframe(6, 24, 16, 1.25), MaskKeyframe(8, 10, 16),
+    ])
+    motion.set_shape("A", "", 10, 16)
+    command = build_ffmpeg_command(input_path, mask_path, output_path, 3, 0, 20, "ultrafast", motion=motion)
+    logger.debug("%s", shlex.join(command))
+    subprocess.run(command, check=True, capture_output=True)
+    cap = cv2.VideoCapture(str(output_path))
+    assert int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) == 10
+    cap.release()
+
+
+def test_multiple_shape_filter_encodes_a_video(tmp_path):
+    input_path = tmp_path / "input.mp4"
+    mask_path = tmp_path / "mask.png"
+    output_path = tmp_path / "output.mp4"
+    source = [
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=32x32:r=10:d=1",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(input_path),
+    ]
+    subprocess.run(source, check=True, capture_output=True)
+    mask_a = np.zeros((32, 32), dtype=np.uint8); mask_a[:, :12] = 255
+    mask_b = np.zeros((32, 32), dtype=np.uint8); mask_b[:, 20:] = 255
+    assert cv2.imwrite(str(mask_path), mask_a)
+    shape_b_path = default_shape_path(mask_path, "B")
+    assert cv2.imwrite(str(shape_b_path), mask_b)
+    motion = MaskMotion(32, 32, 10)
+    motion.set_shape("A", "", 6, 16)
+    motion.set_shape("B", shape_b_path.name, 26, 16)
+    motion.keyframes = [MaskKeyframe(0, 6, 16, 1, "A"), MaskKeyframe(5, 26, 16, 1, "B")]
+    command = build_ffmpeg_command(
+        input_path, mask_path, output_path, 3, 0, 20, "ultrafast", motion=motion,
+        shape_paths=motion_shape_paths(motion, mask_path),
+    )
+    assert command.count("-i") == 3
+    subprocess.run(command, check=True, capture_output=True)
+    cap = cv2.VideoCapture(str(output_path))
+    assert int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) == 10
+    cap.release()
 
 
 def test_default_paths(tmp_path, monkeypatch):
@@ -1275,7 +2202,8 @@ def test_mask_painter(tmp_path):
 def test_apply_blur():
     image = np.zeros((40, 40, 3), dtype=np.uint8)
     image[20:, :] = 255
-    assert apply_blur(image, 0, 0) is image
+    original = image.copy()
+    np.testing.assert_array_equal(apply_blur(image, 0, 0), original)
     assert apply_blur(image, 3.0, 0).shape == image.shape
     assert apply_blur(image, 0, 8).shape == image.shape
 

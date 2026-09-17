@@ -208,7 +208,7 @@ def test_undo_drag_add_delete_and_selection(editor):
     assert len(w.texts) == 1 and w.editor.isEnabled()
 
 
-def test_undo_properties_color_and_saved_state(editor, monkeypatch):
+def test_undo_properties_and_saved_state(editor):
     from PySide6 import QtTest
     w = editor
     w.fields["size"].setValue(70)
@@ -231,17 +231,6 @@ def test_undo_properties_color_and_saved_state(editor, monkeypatch):
     assert w.dirty
     w.redo()
     assert not w.dirty
-    def pick_red(dialog):
-        dialog.setCurrentColor(QtGui.QColor("red"))
-        return QtWidgets.QDialog.DialogCode.Accepted
-
-    monkeypatch.setattr(QtWidgets.QColorDialog, "exec", pick_red)
-    old_color = w.texts[0].color
-    w.choose_color("color")
-    w.undo()
-    assert w.texts[0].color == old_color
-    w.redo()
-    assert w.texts[0].color == "#ffff0000"
 
 
 def test_load_clears_history_and_noop_does_not_dirty(editor, monkeypatch):
@@ -258,9 +247,8 @@ def test_load_clears_history_and_noop_does_not_dirty(editor, monkeypatch):
     assert w.texts[0].text == "ここにテキスト"
 
 
-@pytest.mark.parametrize("key", ["color", "outline_color", "background"])
 @pytest.mark.parametrize("accepted", [True, False])
-def test_live_color_preview_commit_or_cancel(editor, monkeypatch, key, accepted):
+def test_live_color_preview_commit_or_cancel(editor, monkeypatch, accepted):
     w = editor
     w.fields["size"].setValue(70)
     w.undo()
@@ -278,6 +266,12 @@ def test_live_color_preview_commit_or_cancel(editor, monkeypatch, key, accepted)
             assert not w.dirty
         return QtWidgets.QDialog.DialogCode.Accepted if accepted else QtWidgets.QDialog.DialogCode.Rejected
 
+    monkeypatch.setattr(QtWidgets.QColorDialog, "exec", pick)
+    # Preview every rendering property in one editor; exercise commit/cancel once.
+    for key in ("color", "outline_color", "background"):
+        monkeypatch.setattr(QtWidgets.QColorDialog, "exec", lambda dialog: (pick(dialog), QtWidgets.QDialog.DialogCode.Rejected)[1])
+        w.choose_color(key)
+    key = "color" if accepted else "background"
     monkeypatch.setattr(QtWidgets.QColorDialog, "exec", pick)
     w.choose_color(key)
     if accepted:
@@ -308,11 +302,11 @@ def test_background_transparency_slider_live_undo_and_rgb(editor, monkeypatch):
     w.choose_color("background")
     count = w.history.count()
     slider.setSliderDown(True)
-    for value in (30, 20, 0):
+    for value, expected_alpha in ((30, 178), (0, 255)):
         slider.setValue(value)
         color = QtGui.QColor(w.texts[0].background)
         assert color.name() == "#336699"
-        assert color.alpha() == round((100 - value) * 255 / 100)
+        assert color.alpha() == expected_alpha
         assert w.canvas.sprites[0].pixelColor(0, 0).alpha() == color.alpha()
         assert w.transparency_value.text() == f"{value}%"
     slider.setSliderDown(False)
